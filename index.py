@@ -62,6 +62,7 @@ db = DatabaseManager()
 openai_api_key = os.getenv("OPENAI_API_KEY")
 groq_api_key = os.getenv("GROQ_API_KEY")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
+openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 
 class AIClientAdapter:
     def __init__(self, client_mode, ollama_url):
@@ -70,34 +71,47 @@ class AIClientAdapter:
         self.openai_client = OpenAI(api_key=openai_api_key)
         self.groq_client = Groq(api_key=groq_api_key)
         self.gemini_client = genai.Client(api_key=gemini_api_key)
+        self.openrouter_client = None
+        if openrouter_api_key:
+            self.openrouter_client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=openrouter_api_key,
+            )
 
-    def chat_completions_create(self, model, messages, temperature=0.2, response_format=None):
-        # expect llama3.2 as the model name
-        local = {
+        self.local_models = {
             "llama3.2": "llama3.2",
             "gpt-4o": "llama3.2"
         }
-        groq = {
+        self.groq_models = {
             "llama-3.3": "llama-3.3-70b-versatile",
             "llama-3.2": "llama3-70b-8192"
         }
-        gemini = {
+        self.gemini_models = {
             "gemini-1.5-flash": "gemini-1.5-flash",
             "gemini-1.5-pro": "gemini-1.5-pro",
             "gemini-2.0-flash": "gemini-2.0-flash"
         }
+
+    def chat_completions_create(self, model, messages, temperature=0.2, response_format=None):
         if self.client_mode == "LOCAL":
             # Use Ollama client
             data = {
                 "messages": messages,
-                "model": local[model],
+                "model": self.local_models.get(model, model),
                 "stream": False,
             }
             response = requests.post(self.ollama_url, json=data)
             return json.loads(response.text)["message"]["content"]
         elif self.client_mode == "ONLINE":
-            # Use OpenAI or Groq client based on the model
-            if "gpt" in model:
+            # Use OpenAI, Groq, Gemini, or OpenRouter client based on the model
+            if "/" in model and self.openrouter_client:
+                return self.openrouter_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    response_format=response_format
+                ).choices[0].message.content
+            elif "gpt" in model:
                 return self.openai_client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -106,7 +120,7 @@ class AIClientAdapter:
                 ).choices[0].message.content
             elif "llama" in model:
                 return self.groq_client.chat.completions.create(
-                    model=groq[model],
+                    model=self.groq_models.get(model, model),
                     messages=messages,
                     temperature=temperature,
                     response_format=response_format
@@ -165,7 +179,7 @@ class AIClientAdapter:
                 )
 
                 response = self.gemini_client.models.generate_content(
-                    model=gemini[model],
+                    model=self.gemini_models.get(model, model),
                     contents=contents,
                     config=generate_content_config,
                 ).text
@@ -2279,6 +2293,40 @@ def store_memory_data(memory_obj: dict, user_id: str, meeting_obj_id: str, pool:
         logger.error(f"Failed to store memory data: {str(e)}")
 
 
-if __name__ == "__main__":
-    port = int(os.getenv('PORT', 8080))
-    app.start(port=port, host="0.0.0.0")
+@app.get("/health")
+def health(request: Request):
+    return "OK"
+
+
+@app.get("/models")
+async def get_models(request: Request):
+    """
+    Fetches the list of available AI models from OpenRouter.
+    """
+    try:
+        response = requests.get("https://openrouter.ai/api/v1/models")
+        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
+        models_data = response.json().get("data", [])
+
+        # Filter and format to return only id and name for user-friendliness
+        friendly_models = [
+            {"id": model.get("id"), "name": model.get("name")}
+            for model in models_data
+            if model.get("id") and model.get("name")
+        ]
+
+        return Response(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(friendly_models),
+        )
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching models from OpenRouter: {e}")
+        return Response(
+            status_code=500,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"error": "Failed to fetch models from OpenRouter."}),
+        )
+
+
+app.start(host="0.0.0.0", port=8080)
